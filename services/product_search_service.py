@@ -259,40 +259,80 @@ class ProductSearchService:
             ]
         }
 
-    def _normalize_city(self, city: str) -> str:
-        """Normalize city name for better matching"""
-        # Remove extra spaces
+    def _normalize_city(self, city: str) -> List[str]:
+        """Normalize city name for better matching - handles Tel Aviv variations"""
+        # Remove extra spaces and strip
         city = ' '.join(city.split()).strip()
-        return city
+
+        # Handle Tel Aviv variations specifically
+        city_mappings = {
+            'תל אביב': ['תל אביב', 'תל-אביב', 'תל אבית יפה'],
+            'tel aviv': ['תל אביב', 'תל-אביב'],
+            'תל אביב יפו': ['תל אביב', 'תל-אביב'],
+            'ירושלים': ['ירושלים'],
+            'jerusalem': ['ירושלים'],
+            'חיפה': ['חיפה'],
+            'haifa': ['חיפה'],
+        }
+
+        # Check if input matches any mapping key
+        city_lower = city.lower()
+        for key, variations in city_mappings.items():
+            if city_lower == key.lower():
+                return variations  # Return list of variations to search for
+
+        return [city]  # Return as list for consistent handling
 
     def _get_branches_in_city(self, city: str) -> List[Branch]:
         """Get all branches in a city with very flexible matching"""
-        # Normalize the input city
-        city_normalized = self._normalize_city(city)
+        # Get normalized city variations
+        city_variations = self._normalize_city(city)
 
-        # Try exact match first
-        branches = self.db.query(Branch).filter(
-            Branch.city == city_normalized
-        ).all()
+        if not isinstance(city_variations, list):
+            city_variations = [city_variations]
 
-        # If no exact match, try contains match (both ways)
-        if not branches:
+        all_branches = []
+
+        for city_variant in city_variations:
+            # Try exact match first
             branches = self.db.query(Branch).filter(
-                or_(
-                    Branch.city.ilike(f'%{city_normalized}%'),
-                    func.lower(city_normalized).like(func.concat('%', func.lower(Branch.city), '%'))
-                )
+                Branch.city == city_variant
             ).all()
 
-        # Log what we found
-        if branches:
-            logger.info(f"Found {len(branches)} branches for city '{city}' (normalized: '{city_normalized}')")
-            for branch in branches[:2]:  # Log first 2 for debugging
-                logger.debug(f"  - Branch: {branch.name} in {branch.city}")
-        else:
-            logger.warning(f"No branches found for city '{city}' (normalized: '{city_normalized}')")
-            # Log all available cities for debugging
-            all_cities = self.db.query(Branch.city).distinct().limit(5).all()
-            logger.debug(f"Available cities (first 5): {[c[0] for c in all_cities]}")
+            # If no exact match, try case-insensitive partial match
+            if not branches:
+                branches = self.db.query(Branch).filter(
+                    func.lower(Branch.city).like(f'%{city_variant.lower()}%')
+                ).all()
 
-        return branches
+            all_branches.extend(branches)
+
+        # Remove duplicates by branch_id
+        unique_branches = []
+        seen_ids = set()
+        for branch in all_branches:
+            if branch.branch_id not in seen_ids:
+                unique_branches.append(branch)
+                seen_ids.add(branch.branch_id)
+
+        # Log what we found
+        if unique_branches:
+            logger.info(f"Found {len(unique_branches)} branches for city '{city}' (searching variations: {city_variations})")
+            # Group by chain for debugging
+            by_chain = {}
+            for branch in unique_branches:
+                try:
+                    chain_name = branch.chain.display_name if hasattr(branch, 'chain') else 'Unknown'
+                except:
+                    chain_name = 'Unknown'
+                if chain_name not in by_chain:
+                    by_chain[chain_name] = 0
+                by_chain[chain_name] += 1
+            logger.info(f"  Branch distribution: {by_chain}")
+        else:
+            logger.warning(f"No branches found for city '{city}' with variations {city_variations}")
+            # Log available cities for debugging
+            sample_cities = self.db.query(Branch.city).distinct().limit(10).all()
+            logger.debug(f"Available cities (sample): {[c[0] for c in sample_cities]}")
+
+        return unique_branches
