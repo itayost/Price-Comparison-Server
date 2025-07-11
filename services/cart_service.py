@@ -1,11 +1,21 @@
+# services/cart_service.py
+"""
+Cart comparison service with standardized city names
+"""
+
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
+import sys
+import os
 
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database.new_models import Chain, Branch, ChainProduct, BranchPrice
+from utils.city_utils import standardize_city_name
 
 logger = logging.getLogger(__name__)
 
@@ -56,30 +66,32 @@ class CartComparisonService:
 
         Args:
             items: List of items with barcode and quantity
-            city: City name to search in
+            city: City name to search in (will be standardized)
 
         Returns:
             CartComparison with cheapest store and all store comparisons
         """
         logger.info(f"Comparing cart with {len(items)} items in {city}")
 
-        # Normalize city name
-        city = self._normalize_city(city)
+        # Standardize city name
+        standardized_city = standardize_city_name(city)
+        if city != standardized_city:
+            logger.info(f"Standardized city: '{city}' -> '{standardized_city}'")
 
         # Get all branches in the city
-        branches = self._get_branches_in_city(city)
+        branches = self._get_branches_in_city(standardized_city)
         if not branches:
-            logger.warning(f"No stores found in city: {city}")
+            logger.warning(f"No stores found in city: {standardized_city}")
             return CartComparison(
                 cart_items=items,
                 total_items=len(items),
                 cheapest_store=None,
                 all_stores=[],
                 comparison_time=datetime.utcnow(),
-                city=city
+                city=standardized_city
             )
 
-        logger.info(f"Found {len(branches)} stores in {city}")
+        logger.info(f"Found {len(branches)} stores in {standardized_city}")
 
         # Calculate prices for each store
         store_prices = []
@@ -100,37 +112,25 @@ class CartComparisonService:
             cheapest_store=cheapest,
             all_stores=store_prices,
             comparison_time=datetime.utcnow(),
-            city=city
+            city=standardized_city
         )
 
-    def _normalize_city(self, city: str) -> str:
-        """Normalize city name for matching"""
-        # Remove extra spaces and convert to title case
-        city = ' '.join(city.split()).strip()
-
-        # Handle common variations
-        city_mappings = {
-            'תל אביב': 'תל אביב',
-            'תל אביב יפו': 'תל אביב',
-            'tel aviv': 'תל אביב',
-            'jerusalem': 'ירושלים',
-            'haifa': 'חיפה',
-        }
-
-        return city_mappings.get(city.lower(), city)
-
     def _get_branches_in_city(self, city: str) -> List[Branch]:
-        """Get all branches in a city"""
-        # Try exact match first
+        """
+        Get all branches in a city.
+        Since cities are now standardized, we can use exact match.
+        """
+        # Use exact match since cities are standardized
         branches = self.db.query(Branch).filter(
             Branch.city == city
         ).all()
 
-        # If no exact match, try case-insensitive partial match
-        if not branches:
-            branches = self.db.query(Branch).filter(
-                func.lower(Branch.city).like(f'%{city.lower()}%')
-            ).all()
+        if branches:
+            logger.debug(f"Found {len(branches)} branches in {city}")
+        else:
+            # Log available cities for debugging
+            sample_cities = self.db.query(Branch.city).distinct().limit(5).all()
+            logger.debug(f"No branches in '{city}'. Sample cities: {[c[0] for c in sample_cities]}")
 
         return branches
 
@@ -182,10 +182,10 @@ class CartComparisonService:
                     'total_price': 0,
                     'available': False
                 })
-        
+
         # Get chain info
         chain = self.db.query(Chain).filter(Chain.chain_id == branch.chain_id).first()
-        
+
         return StorePrice(
             branch_id=branch.branch_id,
             branch_name=branch.name,
@@ -198,11 +198,11 @@ class CartComparisonService:
             total_price=total_price,
             items_detail=items_detail
         )
-    
+
     def _find_best_store(self, store_prices: List[StorePrice]) -> Optional[StorePrice]:
         """
         Find the best store considering both price and item availability.
-        
+
         Strategy:
         1. Prefer stores with all items
         2. Among stores with same availability, choose cheapest
@@ -210,7 +210,7 @@ class CartComparisonService:
         """
         if not store_prices:
             return None
-        
+
         # Group by number of available items
         by_availability = {}
         for store in store_prices:
@@ -218,14 +218,14 @@ class CartComparisonService:
             if count not in by_availability:
                 by_availability[count] = []
             by_availability[count].append(store)
-        
+
         # Get the highest availability count
         max_items = max(by_availability.keys())
-        
+
         # Return cheapest among stores with most items
         best_stores = by_availability[max_items]
         return min(best_stores, key=lambda x: x.total_price)
-    
+
     def get_product_info(self, barcode: str) -> Optional[Dict[str, Any]]:
         """Get product information across all chains"""
         products = self.db.query(
@@ -237,13 +237,13 @@ class CartComparisonService:
         ).filter(
             ChainProduct.barcode == barcode
         ).all()
-        
+
         if not products:
             return None
-        
+
         # Return the first product found (they should all be the same product)
         name, chain_id, chain_name = products[0]
-        
+
         # Get price range
         prices = self.db.query(
             func.min(BranchPrice.price).label('min_price'),
@@ -254,7 +254,7 @@ class CartComparisonService:
         ).filter(
             ChainProduct.barcode == barcode
         ).first()
-        
+
         return {
             'barcode': barcode,
             'name': name,
@@ -265,7 +265,7 @@ class CartComparisonService:
                 'avg': float(prices.avg_price) if prices.avg_price else 0
             }
         }
-    
+
     def search_products(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Search for products by name or barcode"""
         # Search in product names
@@ -281,7 +281,7 @@ class CartComparisonService:
             ChainProduct.barcode,
             ChainProduct.name
         ).limit(limit).all()
-        
+
         results = []
         for barcode, name, availability in products:
             results.append({
@@ -289,5 +289,5 @@ class CartComparisonService:
                 'name': name,
                 'availability': availability
             })
-        
+
         return results

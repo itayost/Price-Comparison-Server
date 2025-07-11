@@ -1,145 +1,152 @@
-# price_comparison_server/parsers/base_parser.py
+# parsers/base_parser.py
+"""
+Updated base parser with city standardization
+"""
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
-import requests
-import gzip
-from io import BytesIO
 import logging
-from bs4 import BeautifulSoup
+from typing import List, Dict, Any, Optional
+import gzip
+import requests
+from datetime import datetime
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.city_utils import standardize_city_name
 
 logger = logging.getLogger(__name__)
 
 
 class BaseChainParser(ABC):
-    """Abstract base class for chain parsers"""
-    
-    def __init__(self, chain_name: str, chain_id: str):
+    """Base class for all chain parsers with city standardization"""
+
+    def __init__(self, chain_name: str, chain_code: str):
         self.chain_name = chain_name
-        self.chain_id = chain_id
-        self.base_url = None
-        
+        self.chain_code = chain_code
+        self.base_url = self.get_base_url()
+
     @abstractmethod
-    def get_store_file_urls(self) -> List[str]:
-        """Get list of store file URLs to download"""
+    def get_base_url(self) -> str:
+        """Get the base URL for the chain's data files"""
         pass
-    
+
     @abstractmethod
-    def get_price_file_urls(self) -> List[str]:
+    def get_stores_file_url(self) -> str:
+        """Get the URL for the stores list file"""
+        pass
+
+    @abstractmethod
+    def get_price_files_list(self) -> List[str]:
         """Get list of price file URLs to download"""
         pass
-    
+
     @abstractmethod
-    def parse_store_data(self, xml_content: bytes) -> List[Dict[str, Any]]:
-        """Parse store data from XML content"""
+    def parse_stores_data(self, content: str) -> List[Dict[str, Any]]:
+        """
+        Parse stores data from XML content.
+
+        Returns:
+            List of dicts with: store_id, name, address, city
+            Cities will be automatically standardized.
+        """
         pass
-    
+
     @abstractmethod
-    def parse_price_data(self, xml_content: bytes) -> List[Dict[str, Any]]:
-        """Parse price data from XML content"""
+    def parse_price_data(self, content: str) -> List[Dict[str, Any]]:
+        """
+        Parse price data from XML content.
+
+        Returns:
+            List of dicts with: store_id, barcode, name, price
+        """
         pass
-    
-    def download_gz_file(self, url: str) -> Optional[bytes]:
-        """Download and extract GZ file"""
+
+    def download_file(self, url: str) -> Optional[str]:
+        """Download and decompress a file"""
         try:
-            logger.info(f"Downloading: {url}")
+            logger.info(f"Downloading {url}")
             response = requests.get(url, timeout=30)
-            
-            if response.status_code == 200:
-                with gzip.GzipFile(fileobj=BytesIO(response.content)) as f:
-                    return f.read()
+            response.raise_for_status()
+
+            # Decompress if gzipped
+            if url.endswith('.gz'):
+                content = gzip.decompress(response.content).decode('utf-8')
             else:
-                logger.error(f"Failed to download {url}: Status {response.status_code}")
-                return None
-                
+                content = response.text
+
+            return content
+
         except Exception as e:
-            logger.error(f"Error downloading {url}: {str(e)}")
+            logger.error(f"Error downloading {url}: {e}")
             return None
-    
-    def scrape_file_list(self, list_url: str, link_selector: Dict[str, Any], 
-                        file_type_identifier: str) -> List[str]:
+
+    def standardize_store_city(self, store_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Generic method to scrape file lists from index pages
-        
+        Standardize the city name in store data.
+
         Args:
-            list_url: URL of the page listing files
-            link_selector: Dict with 'tag' and search parameters for BeautifulSoup
-            file_type_identifier: String to identify the type of file
+            store_data: Dict containing store information including 'city'
+
+        Returns:
+            Same dict with standardized city name
         """
-        try:
-            response = requests.get(list_url, timeout=30)
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch {list_url}: {response.status_code}")
-                return []
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract tag and search parameters
-            tag = link_selector.get('tag', 'a')
-            
-            # Handle different ways of specifying the search
-            if 'text' in link_selector:
-                # Use text parameter directly
-                links = soup.find_all(tag, text=link_selector['text'])
-            elif 'string' in link_selector:
-                # Use string parameter (newer BeautifulSoup)
-                links = soup.find_all(tag, string=link_selector['string'])
-            elif 'attrs' in link_selector:
-                # Use attributes
-                links = soup.find_all(tag, attrs=link_selector['attrs'])
-            else:
-                # Just find all tags
-                links = soup.find_all(tag)
-            
-            file_urls = []
-            for link in links:
-                href = link.get('href')
-                if href and file_type_identifier in href:
-                    # Handle relative URLs
-                    if not href.startswith('http'):
-                        href = self.base_url + href if self.base_url else href
-                    file_urls.append(href)
-                    
-            logger.info(f"Found {len(file_urls)} {file_type_identifier} files")
-            return file_urls
-            
-        except Exception as e:
-            logger.error(f"Error scraping {list_url}: {e}")
+        if 'city' in store_data:
+            original_city = store_data['city']
+            store_data['city'] = standardize_city_name(original_city)
+
+            if original_city != store_data['city']:
+                logger.debug(f"Standardized city for store {store_data.get('store_id', 'unknown')}: "
+                           f"'{original_city}' -> '{store_data['city']}'")
+
+        return store_data
+
+    def get_stores(self) -> List[Dict[str, Any]]:
+        """Download and parse stores data with standardized city names"""
+        url = self.get_stores_file_url()
+        content = self.download_file(url)
+
+        if not content:
             return []
-    
-    def process_stores(self) -> List[Dict[str, Any]]:
-        """Process all store files and return parsed data"""
-        all_stores = []
-        
-        urls = self.get_store_file_urls()
-        for i, url in enumerate(urls):
-            logger.info(f"Processing store file {i+1}/{len(urls)} for {self.chain_name}")
-            content = self.download_gz_file(url)
-            
-            if content:
-                stores = self.parse_store_data(content)
-                all_stores.extend(stores)
-                logger.info(f"Parsed {len(stores)} stores from file")
-                
-        return all_stores
-    
-    def process_prices(self, branch_id_mapping: Dict[str, int]) -> List[Dict[str, Any]]:
-        """Process all price files and return parsed data"""
-        all_prices = []
-        
-        urls = self.get_price_file_urls()
-        for i, url in enumerate(urls):
-            logger.info(f"Processing price file {i+1}/{len(urls)} for {self.chain_name}")
-            content = self.download_gz_file(url)
-            
+
+        stores = self.parse_stores_data(content)
+
+        # Standardize city names for all stores
+        standardized_stores = []
+        for store in stores:
+            standardized_stores.append(self.standardize_store_city(store))
+
+        # Log city distribution after standardization
+        city_counts = {}
+        for store in standardized_stores:
+            city = store.get('city', 'לא ידוע')
+            city_counts[city] = city_counts.get(city, 0) + 1
+
+        logger.info(f"Standardized {len(standardized_stores)} stores across {len(city_counts)} cities")
+        logger.info(f"Top cities: {sorted(city_counts.items(), key=lambda x: x[1], reverse=True)[:5]}")
+
+        return standardized_stores
+
+    def get_prices(self, limit: Optional[int] = None) -> Dict[str, List[Dict[str, Any]]]:
+        """Download and parse price data"""
+        files = self.get_price_files_list()
+
+        if limit:
+            files = files[:limit]
+
+        all_prices = {}
+
+        for file_url in files:
+            content = self.download_file(file_url)
             if content:
                 prices = self.parse_price_data(content)
-                # Map store IDs to branch IDs
-                for price in prices:
-                    if price['store_id'] in branch_id_mapping:
-                        price['branch_id'] = branch_id_mapping[price['store_id']]
-                        all_prices.append(price)
-                        
-                logger.info(f"Parsed {len(prices)} prices from file")
-                
+                if prices:
+                    # Group by store_id
+                    for price in prices:
+                        store_id = price['store_id']
+                        if store_id not in all_prices:
+                            all_prices[store_id] = []
+                        all_prices[store_id].append(price)
+
         return all_prices

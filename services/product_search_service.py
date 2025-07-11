@@ -1,35 +1,48 @@
-# price_comparison_server/services/product_search_service.py
+# services/product_search_service.py
+"""
+Simplified product search service with standardized city names
+"""
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 import logging
+import sys
+import os
 
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database.new_models import Chain, Branch, ChainProduct, BranchPrice
+from utils.city_utils import standardize_city_name, get_city_variations
 
 logger = logging.getLogger(__name__)
 
 
 class ProductSearchService:
     """Service for searching products with price details by city"""
-    
+
     def __init__(self, db: Session):
         self.db = db
-    
+
     def search_products_with_prices(self, query: str, city: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Search for products and return all prices in the specified city.
-        
+
         Args:
             query: Product name to search for
-            city: City name to filter branches
+            city: City name to filter branches (will be standardized)
             limit: Maximum number of products to return
-            
+
         Returns:
             List of products with their prices across all stores in the city
         """
         logger.info(f"Searching for '{query}' in {city}")
-        
+
+        # Standardize the input city name
+        standardized_city = standardize_city_name(city)
+        if city != standardized_city:
+            logger.info(f"Standardized city: '{city}' -> '{standardized_city}'")
+
         # Normalize search query
         search_term = f"%{query}%"
 
@@ -54,7 +67,7 @@ class ProductSearchService:
             logger.info(f"No products found matching '{query}'")
             return []
 
-        # Group products by barcode to handle same product in different chains
+        # Group products by barcode
         products_by_barcode = {}
         for product in matching_products:
             if product.barcode not in products_by_barcode:
@@ -68,16 +81,15 @@ class ProductSearchService:
                 'chain_name': product.chain_name
             })
 
-        # Get branches in the city with flexible matching
-        city_branches = self._get_branches_in_city(city)
+        # Get branches in the standardized city
+        city_branches = self._get_branches_in_city(standardized_city)
         branch_ids = [branch.branch_id for branch in city_branches]
 
         if not branch_ids:
-            logger.warning(f"No branches found in city: {city}")
-            # Return products without prices
+            logger.warning(f"No branches found in city: {standardized_city}")
             return []
 
-        logger.info(f"Found {len(branch_ids)} branches in {city}")
+        logger.info(f"Found {len(branch_ids)} branches in {standardized_city}")
 
         # Build result with prices
         results = []
@@ -94,10 +106,9 @@ class ProductSearchService:
                 Branch.branch_id,
                 Branch.name.label('branch_name'),
                 Branch.address,
-                Chain.chain_id,
+                Branch.chain_id,
                 Chain.name.label('chain_name_key'),
-                Chain.display_name.label('chain_display_name'),
-                ChainProduct.chain_product_id
+                Chain.display_name.label('chain_display_name')
             ).join(
                 ChainProduct,
                 BranchPrice.chain_product_id == ChainProduct.chain_product_id
@@ -116,33 +127,30 @@ class ProductSearchService:
                 BranchPrice.price
             ).all()
 
-            # Add price information
-            for price_info in prices:
-                product_result['prices_by_store'].append({
-                    'branch_id': price_info.branch_id,
-                    'branch_name': price_info.branch_name,
-                    'branch_address': price_info.address,
-                    'chain_id': price_info.chain_id,
-                    'chain_name': price_info.chain_name_key,
-                    'chain_display_name': price_info.chain_display_name,
-                    'price': float(price_info.price)
-                })
+            if prices:
+                min_price = min(p.price for p in prices)
+                max_price = max(p.price for p in prices)
+                avg_price = sum(p.price for p in prices) / len(prices)
 
-            # Calculate price statistics
-            if product_result['prices_by_store']:
-                prices_list = [p['price'] for p in product_result['prices_by_store']]
+                for price_info in prices:
+                    product_result['prices_by_store'].append({
+                        'branch_id': price_info.branch_id,
+                        'branch_name': price_info.branch_name,
+                        'branch_address': price_info.address,
+                        'chain_id': price_info.chain_id,
+                        'chain_name': price_info.chain_name_key,
+                        'chain_display_name': price_info.chain_display_name,
+                        'price': float(price_info.price),
+                        'is_cheapest': float(price_info.price) == min_price
+                    })
+
                 product_result['price_stats'] = {
-                    'min_price': min(prices_list),
-                    'max_price': max(prices_list),
-                    'avg_price': sum(prices_list) / len(prices_list),
-                    'price_range': max(prices_list) - min(prices_list),
-                    'available_in_stores': len(prices_list)
+                    'min_price': float(min_price),
+                    'max_price': float(max_price),
+                    'avg_price': float(avg_price),
+                    'price_range': float(max_price - min_price),
+                    'available_in_stores': len(prices)
                 }
-
-                # Mark cheapest store
-                min_price = product_result['price_stats']['min_price']
-                for store in product_result['prices_by_store']:
-                    store['is_cheapest'] = store['price'] == min_price
             else:
                 product_result['price_stats'] = {
                     'min_price': 0,
@@ -154,7 +162,7 @@ class ProductSearchService:
 
             results.append(product_result)
 
-        # Sort by availability (products available in more stores first)
+        # Sort by availability
         results.sort(key=lambda x: x['price_stats']['available_in_stores'], reverse=True)
 
         return results
@@ -162,11 +170,14 @@ class ProductSearchService:
     def get_product_details_by_barcode(self, barcode: str, city: str) -> Optional[Dict[str, Any]]:
         """Get detailed price information for a specific product in a city"""
 
-        city_branches = self._get_branches_in_city(city)
+        # Standardize city name
+        standardized_city = standardize_city_name(city)
+
+        city_branches = self._get_branches_in_city(standardized_city)
         branch_ids = [branch.branch_id for branch in city_branches]
 
         if not branch_ids:
-            logger.warning(f"No branches found in city: {city}")
+            logger.warning(f"No branches found in city: {standardized_city}")
             return None
 
         # Get product info
@@ -210,9 +221,9 @@ class ProductSearchService:
             return {
                 'barcode': barcode,
                 'name': product.name,
-                'city': city,
+                'city': standardized_city,
                 'available': False,
-                'message': f'Product not available in {city}'
+                'message': f'Product not available in {standardized_city}'
             }
 
         # Build detailed response
@@ -237,7 +248,7 @@ class ProductSearchService:
         return {
             'barcode': barcode,
             'name': product.name,
-            'city': city,
+            'city': standardized_city,
             'available': True,
             'price_summary': {
                 'min_price': min(all_prices),
@@ -259,80 +270,21 @@ class ProductSearchService:
             ]
         }
 
-    def _normalize_city(self, city: str) -> List[str]:
-        """Normalize city name for better matching - handles Tel Aviv variations"""
-        # Remove extra spaces and strip
-        city = ' '.join(city.split()).strip()
-
-        # Handle Tel Aviv variations specifically
-        city_mappings = {
-            'תל אביב': ['תל אביב', 'תל-אביב', 'תל אבית יפה'],
-            'tel aviv': ['תל אביב', 'תל-אביב'],
-            'תל אביב יפו': ['תל אביב', 'תל-אביב'],
-            'ירושלים': ['ירושלים'],
-            'jerusalem': ['ירושלים'],
-            'חיפה': ['חיפה'],
-            'haifa': ['חיפה'],
-        }
-
-        # Check if input matches any mapping key
-        city_lower = city.lower()
-        for key, variations in city_mappings.items():
-            if city_lower == key.lower():
-                return variations  # Return list of variations to search for
-
-        return [city]  # Return as list for consistent handling
-
     def _get_branches_in_city(self, city: str) -> List[Branch]:
-        """Get all branches in a city with very flexible matching"""
-        # Get normalized city variations
-        city_variations = self._normalize_city(city)
+        """
+        Get all branches in a city.
+        Since cities are now standardized, we can use exact match.
+        """
+        # Use exact match since cities are standardized
+        branches = self.db.query(Branch).filter(
+            Branch.city == city
+        ).all()
 
-        if not isinstance(city_variations, list):
-            city_variations = [city_variations]
-
-        all_branches = []
-
-        for city_variant in city_variations:
-            # Try exact match first
-            branches = self.db.query(Branch).filter(
-                Branch.city == city_variant
-            ).all()
-
-            # If no exact match, try case-insensitive partial match
-            if not branches:
-                branches = self.db.query(Branch).filter(
-                    func.lower(Branch.city).like(f'%{city_variant.lower()}%')
-                ).all()
-
-            all_branches.extend(branches)
-
-        # Remove duplicates by branch_id
-        unique_branches = []
-        seen_ids = set()
-        for branch in all_branches:
-            if branch.branch_id not in seen_ids:
-                unique_branches.append(branch)
-                seen_ids.add(branch.branch_id)
-
-        # Log what we found
-        if unique_branches:
-            logger.info(f"Found {len(unique_branches)} branches for city '{city}' (searching variations: {city_variations})")
-            # Group by chain for debugging
-            by_chain = {}
-            for branch in unique_branches:
-                try:
-                    chain_name = branch.chain.display_name if hasattr(branch, 'chain') else 'Unknown'
-                except:
-                    chain_name = 'Unknown'
-                if chain_name not in by_chain:
-                    by_chain[chain_name] = 0
-                by_chain[chain_name] += 1
-            logger.info(f"  Branch distribution: {by_chain}")
+        if branches:
+            logger.debug(f"Found {len(branches)} branches in {city}")
         else:
-            logger.warning(f"No branches found for city '{city}' with variations {city_variations}")
             # Log available cities for debugging
-            sample_cities = self.db.query(Branch.city).distinct().limit(10).all()
-            logger.debug(f"Available cities (sample): {[c[0] for c in sample_cities]}")
+            sample_cities = self.db.query(Branch.city).distinct().limit(5).all()
+            logger.debug(f"No branches in '{city}'. Sample cities: {[c[0] for c in sample_cities]}")
 
-        return unique_branches
+        return branches
