@@ -171,11 +171,11 @@ async def get_branches_in_city(
     """
     try:
         from database.new_models import Branch, Chain
-        from sqlalchemy import func, or_
+        from sqlalchemy import func
 
-        # Use the search service to get city variations
+        # Normalize city name
         search_service = ProductSearchService(db)
-        city_variations = search_service._normalize_city(city)
+        city_normalized = search_service._normalize_city(city)
 
         # Build query
         query = db.query(
@@ -183,36 +183,23 @@ async def get_branches_in_city(
             Branch.name,
             Branch.address,
             Branch.city,
-            Branch.store_id,
             Chain.chain_id,
             Chain.display_name.label('chain_name')
         ).join(Chain)
 
-        # Create OR conditions for all city variations
-        city_conditions = []
-        for city_var in city_variations:
-            city_conditions.append(
-                func.lower(Branch.city).like(f'%{city_var.lower()}%')
-            )
+        # Apply filters
+        query = query.filter(
+            func.lower(Branch.city).like(f'%{city_normalized.lower()}%')
+        )
 
-        # Apply city filter with OR conditions
-        if city_conditions:
-            query = query.filter(or_(*city_conditions))
-
-        # Apply chain filter if specified
         if chain_id:
             query = query.filter(Chain.chain_id == chain_id)
 
-        # Execute query and order results
         branches = query.order_by(Chain.display_name, Branch.name).all()
-
-        # Log for debugging
-        logger.info(f"Found {len(branches)} branches for city '{city}' with variations: {city_variations}")
 
         return [
             {
                 "branch_id": branch.branch_id,
-                "store_id": branch.store_id,
                 "name": branch.name,
                 "address": branch.address,
                 "city": branch.city,
@@ -224,7 +211,7 @@ async def get_branches_in_city(
 
     except Exception as e:
         logger.error(f"Error getting branches: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get branches: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get branches")
 
 
 @router.get("/autocomplete", response_model=List[str])
