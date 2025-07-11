@@ -176,16 +176,21 @@ class ShufersalParser(BaseChainParser):
         return stores
 
     def parse_price_data(self, content: str) -> List[Dict[str, Any]]:
-        """Parse price data from XML content"""
+
         prices = []
 
         try:
+            # Check for BOM and remove if present
+            if content.startswith('\ufeff'):
+                content = content[1:]
+                logger.debug("Removed BOM from content")
+
             root = ET.fromstring(content)
 
-            # Get store ID
+            # Get store ID - it's at the root level in Shufersal XML
             store_id = None
             for field in ['StoreId', 'StoreID', 'STOREID']:
-                elem = root.find(f'.//{field}')
+                elem = root.find(field)  # Note: not .// for root level
                 if elem is not None and elem.text:
                     store_id = str(int(elem.text.strip()))  # Remove leading zeros
                     break
@@ -194,14 +199,16 @@ class ShufersalParser(BaseChainParser):
                 logger.warning("No store ID found in price file")
                 return prices
 
-            # Find products
-            products = root.findall('.//Product')
-            if not products:
-                products = root.findall('.//Item')
-            if not products:
-                products = root.findall('.//PRODUCT')
+            # Find the Items container first
+            items_container = root.find('Items')
+            if items_container is None:
+                logger.warning("No Items container found in price file")
+                return prices
 
-            logger.debug(f"Found {len(products)} products for store {store_id}")
+            # Now find all Item elements within Items
+            products = items_container.findall('Item')
+
+            logger.info(f"Found {len(products)} products for store {store_id}")
 
             for product in products:
                 try:
@@ -252,8 +259,12 @@ class ShufersalParser(BaseChainParser):
                     logger.warning(f"Error parsing product: {e}")
                     continue
 
+            logger.info(f"Successfully parsed {len(prices)} prices")
+
         except Exception as e:
             logger.error(f"Error parsing price XML: {e}")
+            import traceback
+            traceback.print_exc()
 
         return prices
 

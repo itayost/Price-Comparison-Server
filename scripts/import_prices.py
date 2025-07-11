@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 from sqlalchemy import func
 import re
+import time
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -39,7 +40,8 @@ class PriceImporter:
         self.processed_stores: Set[str] = set()
 
     def import_chain_prices(self, chain_name: str, limit_files: int = None):
-        """Import prices for a specific chain"""
+        """Import prices for a specific chain with timing"""
+        start_time = time.time()
         logger.info(f"\n{'='*60}")
         logger.info(f"Starting price import for {chain_name}")
         logger.info(f"{'='*60}")
@@ -82,6 +84,7 @@ class PriceImporter:
 
         # Process each price file
         for i, url in enumerate(price_urls, 1):
+            file_start = time.time()
             logger.info(f"\nProcessing file {i}/{len(price_urls)}: {url.split('/')[-1]}")
 
             # Try to extract store ID from URL
@@ -91,13 +94,23 @@ class PriceImporter:
 
             self.process_price_file(chain_name, parser, url, branch_mappings, store_id_from_url)
 
+            # Log file processing time
+            file_time = time.time() - file_start
+            logger.info(f"File processed in {file_time:.1f} seconds")
+
             # Log progress every 5 files
             if i % 5 == 0:
                 self.log_progress()
 
+                # Pause briefly every 10 files to avoid overwhelming the database
+                if i % 10 == 0:
+                    logger.info("Pausing for 5 seconds to avoid database overload...")
+                    time.sleep(5)
+
         # Final summary
+        total_time = time.time() - start_time
         logger.info(f"\n{'='*50}")
-        logger.info(f"Completed {chain_name} import")
+        logger.info(f"Completed {chain_name} import in {total_time/60:.1f} minutes")
         logger.info(f"Processed stores: {sorted(self.processed_stores)}")
         logger.info(f"Skipped stores: {sorted(self.skipped_stores)}")
 
@@ -142,11 +155,11 @@ class PriceImporter:
 
     def process_price_file(self, chain_name: str, parser, url: str,
                           branch_mappings: Dict[str, int], store_id_hint: Optional[str] = None):
-        """Process a single price file"""
+        """Process a single price file with connection management"""
         try:
             # Download and parse file
             logger.debug(f"Downloading: {url}")
-            content = parser.download_gz_file(url)
+            content = parser.download_file(url)
 
             if not content:
                 logger.error(f"Failed to download {url}")
@@ -194,6 +207,12 @@ class PriceImporter:
             self.import_price_batch(chain_name, prices, branch_mappings)
             self.stats['files_processed'] += 1
 
+            # Force garbage collection after large files
+            if len(prices) > 1000:
+                import gc
+                gc.collect()
+                logger.debug("Forced garbage collection after large file")
+
         except Exception as e:
             logger.error(f"Error processing price file {url}: {e}")
             self.stats['errors'] += 1
@@ -209,26 +228,46 @@ class PriceImporter:
             return f"Branch {branch_id}"
 
     def import_price_batch(self, chain_name: str, prices: List[Dict], branch_mappings: Dict[str, int]):
-        """Import a batch of prices"""
+
         with get_db() as db:
             chain = db.query(Chain).filter(Chain.name == chain_name).first()
             if not chain:
                 logger.error(f"Chain '{chain_name}' not found")
                 return
 
-            # Process in smaller batches to avoid memory issues
-            batch_size = 1000
+            # Reduce batch size for Oracle
+            batch_size = 100  # Reduced from 1000
+            total_batches = (len(prices) + batch_size - 1) // batch_size
+
             for i in range(0, len(prices), batch_size):
                 batch = prices[i:i + batch_size]
-                self._process_batch(db, chain.chain_id, batch, branch_mappings)
+                batch_num = i // batch_size + 1
 
-                # Commit after each batch
                 try:
+                    self._process_batch(db, chain.chain_id, batch, branch_mappings)
+
+                    # Commit after each batch
                     db.commit()
-                    logger.debug(f"Committed batch {i//batch_size + 1}")
+                    logger.info(f"Committed batch {batch_num}/{total_batches} ({len(batch)} items)")
+
                 except Exception as e:
-                    logger.error(f"Failed to commit batch: {e}")
+                    logger.error(f"Failed to process batch {batch_num}: {e}")
                     db.rollback()
+
+                    # Try to recover by creating a new session
+                    try:
+                        db.close()
+                        db = get_db().__enter__()  # Get a fresh connection
+                        logger.info("Reconnected to database, retrying batch...")
+
+                        # Retry the batch
+                        self._process_batch(db, chain.chain_id, batch, branch_mappings)
+                        db.commit()
+                        logger.info(f"Successfully retried batch {batch_num}")
+
+                    except Exception as retry_error:
+                        logger.error(f"Retry failed for batch {batch_num}: {retry_error}")
+                        self.stats['errors'] += len(batch)
 
     def _process_batch(self, db, chain_id: int, batch: List[Dict], branch_mappings: Dict[str, int]):
         """Process a single batch of prices"""

@@ -24,13 +24,12 @@ class VictoryParser(BaseChainParser):
 
     def __init__(self):
         super().__init__('victory', '7290696200003')
-        self.base_url = 'https://laibcatalog.co.il'
         self.stores_list_url = 'https://laibcatalog.co.il/NBCompetitionRegulations.aspx?code=7290696200003&fileType=storesfull'
         self.prices_list_url = 'https://laibcatalog.co.il/NBCompetitionRegulations.aspx?code=7290696200003&fileType=pricefull'
 
     def get_base_url(self) -> str:
-        """Get the base URL for Victory data files"""
-        return self.base_url
+
+        return 'https://laibcatalog.co.il'
 
     def get_stores_file_url(self) -> str:
         """Get the URL for the stores list file"""

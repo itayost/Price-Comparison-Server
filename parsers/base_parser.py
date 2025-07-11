@@ -70,11 +70,32 @@ class BaseChainParser(ABC):
             response = requests.get(url, timeout=30)
             response.raise_for_status()
 
-            # Decompress if gzipped
-            if url.endswith('.gz'):
-                content = gzip.decompress(response.content).decode('utf-8')
+            # Get raw content as bytes
+            raw_content = response.content
+
+            # Check if it's gzipped by looking at magic bytes
+            # GZip files start with 1f 8b
+            if raw_content[:2] == b'\x1f\x8b' or url.endswith('.gz'):
+                try:
+                    # Decompress gzip content
+                    content = gzip.decompress(raw_content).decode('utf-8')
+                    logger.debug(f"Successfully decompressed {len(raw_content)} bytes to {len(content)} characters")
+                except Exception as e:
+                    logger.error(f"Failed to decompress gzip content: {e}")
+                    return None
             else:
-                content = response.text
+                # Not gzipped, decode directly
+                try:
+                    content = raw_content.decode('utf-8')
+                except UnicodeDecodeError:
+                    # Try with different encoding
+                    content = raw_content.decode('utf-8', errors='ignore')
+                    logger.warning("Had to ignore some unicode errors during decoding")
+
+            # Remove BOM if present
+            if content.startswith('\ufeff'):
+                content = content[1:]
+                logger.debug("Removed BOM from content")
 
             return content
 
