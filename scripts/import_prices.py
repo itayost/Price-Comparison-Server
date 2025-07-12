@@ -1,23 +1,25 @@
-# scripts/import_prices_oracle.py
-"""Oracle-optimized price importer with aggressive timeout handling"""
+# scripts/import_prices_optimized.py
 
 import os
 import sys
-from pathlib import Path
-from typing import Dict, List, Any, Set, Optional
-import logging
-from datetime import datetime
-from sqlalchemy import text, create_engine
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import NullPool
-from sqlalchemy.exc import DatabaseError, DisconnectionError, OperationalError
-import re
 import time
-import oracledb
+import logging
+from pathlib import Path
+from typing import Dict, List, Any, Set
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+import threading
+import queue
+
+import pandas as pd
+from sqlalchemy import text, bindparam
+from sqlalchemy.orm import Session
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from database.connection import get_db_with_retry, USE_ORACLE, engine
 from database.new_models import Chain, Branch, ChainProduct, BranchPrice
 from parsers import get_parser
 
@@ -28,92 +30,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Oracle-specific configuration
-oracledb.defaults.config_dir = os.getenv("TNS_ADMIN", "./wallet")
-oracledb.defaults.tcp_connect_timeout = 30.0
-oracledb.defaults.call_timeout = 60000  # 60 seconds in milliseconds
-
-
-class OracleOptimizedImporter:
-    """Price importer optimized for Oracle Cloud with timeout handling"""
+class OptimizedPriceImporter:
+    """Optimized price importer for Oracle Cloud"""
 
     def __init__(self):
-        self.stats = {
-            'products_created': 0,
-            'products_updated': 0,
-            'prices_created': 0,
-            'prices_updated': 0,
-            'errors': 0,
-            'branches_skipped': 0,
-            'files_processed': 0,
-            'files_skipped': 0,
-            'connection_retries': 0
-        }
+        self.stats = defaultdict(int)
+        self.stats_lock = threading.Lock()
 
-        # Oracle-optimized batch sizes
-        self.batch_size = 5 if self._is_oracle() else 50
-        self.commit_interval = 10  # Commit every N batches
+        # Optimal batch sizes based on testing
+        self.batch_size = 25000 if USE_ORACLE else 1000
+        self.commit_size = 100000 if USE_ORACLE else 10000
 
-        # Connection pool settings
-        self.engine = self._create_engine()
-        self.SessionLocal = sessionmaker(bind=self.engine)
+        # Thread pool for parallel processing
+        self.max_workers = 4 if USE_ORACLE else 2
 
-    def _is_oracle(self) -> bool:
-        """Check if using Oracle database"""
-        return os.getenv("USE_ORACLE", "false").lower() == "true"
+        # Queue for batching
+        self.batch_queue = queue.Queue(maxsize=100)
 
-    def _create_engine(self):
-        """Create SQLAlchemy engine with Oracle optimizations"""
-        if self._is_oracle():
-            # Oracle configuration
-            user = os.getenv("ORACLE_USER")
-            password = os.getenv("ORACLE_PASSWORD")
-            dsn = os.getenv("ORACLE_DSN", "champdb_low")
+        logger.info(f"Initialized with batch_size={self.batch_size}, workers={self.max_workers}")
 
-            # Create connection string
-            connection_string = f"oracle+oracledb://{user}:{password}@{dsn}"
-
-            # Create engine with NullPool to avoid connection pooling issues
-            engine = create_engine(
-                connection_string,
-                poolclass=NullPool,
-                connect_args={
-                    "config_dir": os.getenv("TNS_ADMIN", "./wallet"),
-                    "tcp_connect_timeout": 30,
-                    "retry_count": 3,
-                    "retry_delay": 1
-                }
-            )
-        else:
-            # SQLite configuration
-            database_url = os.getenv("DATABASE_URL", "sqlite:///./price_comparison.db")
-            engine = create_engine(database_url)
-
-        return engine
-
-    def _get_session_with_retry(self, max_retries: int = 3) -> Session:
-        """Get database session with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                session = self.SessionLocal()
-                # Test connection
-                session.execute(text("SELECT 1"))
-                return session
-            except (DatabaseError, DisconnectionError, OperationalError) as e:
-                self.stats['connection_retries'] += 1
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.warning(f"Connection failed (attempt {attempt + 1}), retrying in {wait_time}s: {str(e)[:100]}")
-                    time.sleep(wait_time)
-                else:
-                    raise
-
-    def import_chain_prices(self, chain_name: str, limit_files: Optional[int] = None):
-        """Import prices for a chain with Oracle optimizations"""
+    def import_chain_prices(self, chain_name: str, limit_files: int = None):
+        """Import prices for a chain with parallel processing"""
         start_time = time.time()
+
         logger.info(f"\n{'='*60}")
-        logger.info(f"Starting Oracle-optimized import for {chain_name}")
-        logger.info(f"Batch size: {self.batch_size}, Commit interval: {self.commit_interval}")
+        logger.info(f"Starting optimized import for {chain_name}")
+        logger.info(f"Batch size: {self.batch_size}, Workers: {self.max_workers}")
         logger.info(f"{'='*60}")
 
         # Get parser
@@ -122,305 +64,329 @@ class OracleOptimizedImporter:
             logger.error(f"No parser for {chain_name}")
             return
 
-        # Get branch mappings
-        branch_mappings = self._get_branch_mappings(chain_name)
-        if not branch_mappings:
+        # Pre-load data for efficient lookups
+        logger.info("Loading branch and product mappings...")
+        branch_map, chain_id = self._load_branch_mappings(chain_name)
+        product_cache = {}  # Will be populated on demand
+
+        if not branch_map:
             logger.error(f"No branches found for {chain_name}")
             return
 
-        logger.info(f"Found {len(branch_mappings)} branches")
+        logger.info(f"Found {len(branch_map)} branches")
 
         # Get price files
         price_urls = parser.get_price_file_urls()
-        if not price_urls:
-            logger.error(f"No price files found")
-            return
-
-        logger.info(f"Found {len(price_urls)} price files")
-
         if limit_files:
             price_urls = price_urls[:limit_files]
-            logger.info(f"Limited to {limit_files} files")
 
-        # Process each file
-        for i, url in enumerate(price_urls, 1):
-            filename = os.path.basename(url).split('?')[0]
-            logger.info(f"\nFile {i}/{len(price_urls)}: {filename}")
+        logger.info(f"Processing {len(price_urls)} price files")
 
-            try:
-                self._process_file_with_retry(chain_name, parser, url, branch_mappings)
-                self.stats['files_processed'] += 1
-            except Exception as e:
-                logger.error(f"Failed to process file after retries: {str(e)[:200]}")
-                self.stats['files_skipped'] += 1
+        # Start worker threads
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Start batch processor
+            batch_processor = executor.submit(self._batch_processor, chain_id, product_cache)
 
-        # Summary
-        elapsed = time.time() - start_time
-        logger.info(f"\nCompleted in {elapsed:.1f} seconds")
-        self._show_summary()
+            # Submit file processing tasks
+            futures = []
+            for i, url in enumerate(price_urls):
+                future = executor.submit(
+                    self._process_file_parallel,
+                    parser, url, branch_map, i, len(price_urls)
+                )
+                futures.append(future)
 
-    def _get_branch_mappings(self, chain_name: str) -> Dict[str, int]:
-        """Get store_id -> branch_id mappings with retry"""
-        mappings = {}
-
-        session = self._get_session_with_retry()
-        try:
-            chain = session.query(Chain).filter(Chain.name == chain_name).first()
-            if not chain:
-                return mappings
-
-            branches = session.query(Branch).filter(Branch.chain_id == chain.chain_id).all()
-            for branch in branches:
-                mappings[branch.store_id] = branch.branch_id
-                # Also without leading zeros
+            # Wait for all files to be processed
+            for future in as_completed(futures):
                 try:
-                    mappings[str(int(branch.store_id))] = branch.branch_id
+                    future.result()
+                except Exception as e:
+                    logger.error(f"File processing failed: {e}")
+
+            # Signal batch processor to stop
+            self.batch_queue.put(None)
+            batch_processor.result()
+
+        # Final summary
+        elapsed = time.time() - start_time
+        self._show_summary(elapsed)
+
+    def _load_branch_mappings(self, chain_name: str) -> tuple:
+        """Load branch mappings with efficient query"""
+        mappings = {}
+        chain_id = None
+
+        with get_db_with_retry() as db:
+            # Get chain
+            chain = db.query(Chain).filter(Chain.name == chain_name).first()
+            if not chain:
+                return mappings, None
+
+            chain_id = chain.chain_id
+
+            # Load all branches at once with city information for logging
+            branches = db.query(
+                Branch.branch_id,
+                Branch.store_id,
+                Branch.city  # Include city for verification
+            ).filter(
+                Branch.chain_id == chain_id
+            ).all()
+
+            # Count cities (all should be standardized already)
+            city_counts = {}
+
+            for branch_id, store_id, city in branches:
+                mappings[store_id] = branch_id
+                # Also map without leading zeros
+                try:
+                    mappings[str(int(store_id))] = branch_id
                 except:
                     pass
 
-            return mappings
-        finally:
-            session.close()
+                # Count cities
+                city_counts[city] = city_counts.get(city, 0) + 1
 
-    def _process_file_with_retry(self, chain_name: str, parser, url: str,
-                                  branch_mappings: Dict[str, int], max_retries: int = 3):
-        """Process a file with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                # Download file
-                content = parser.download_file(url)
-                if not content:
-                    logger.warning(f"No content downloaded from {url}")
-                    return
+            # Log city distribution
+            logger.info(f"Loaded {len(branches)} branches across {len(city_counts)} cities")
+            logger.info(f"Top cities: {sorted(city_counts.items(), key=lambda x: x[1], reverse=True)[:5]}")
 
-                # Parse prices
-                prices = parser.parse_price_data(content)
-                if not prices:
-                    logger.warning(f"No prices parsed from {url}")
-                    return
+        return mappings, chain_id
 
-                logger.info(f"Parsed {len(prices)} prices")
+    def _process_file_parallel(self, parser, url: str, branch_map: dict,
+                               file_num: int, total_files: int):
+        """Process a single file and queue batches"""
+        filename = os.path.basename(url).split('?')[0]
+        logger.info(f"Processing file {file_num + 1}/{total_files}: {filename}")
 
-                # Extract store ID
-                store_id = self._extract_store_id(prices, url)
-                if not store_id:
-                    logger.error("No store ID found")
-                    return
-
-                # Check if we have this branch
-                branch_id = branch_mappings.get(store_id) or branch_mappings.get(str(int(store_id)))
-                if not branch_id:
-                    logger.warning(f"Store {store_id} not in mappings")
-                    self.stats['branches_skipped'] += 1
-                    return
-
-                # Process prices in micro-batches
-                self._import_prices_oracle_optimized(chain_name, branch_id, prices)
-                return
-
-            except (DatabaseError, DisconnectionError, OperationalError) as e:
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    logger.warning(f"Database error processing file (attempt {attempt + 1}), retrying in {wait_time}s")
-                    time.sleep(wait_time)
-                else:
-                    raise
-            except Exception as e:
-                logger.error(f"Unexpected error processing file: {str(e)[:200]}")
-                raise
-
-    def _extract_store_id(self, prices: List[Dict], url: str) -> Optional[str]:
-        """Extract store ID from prices or URL"""
-        # From prices
-        store_ids = {p.get('store_id') for p in prices if p.get('store_id')}
-        if store_ids:
-            return str(int(list(store_ids)[0]))  # Remove leading zeros
-
-        # From URL
-        patterns = [r'-(\d{3})-', r'Store(\d+)', r'store[_-]?(\d+)']
-        filename = url.split('/')[-1].split('?')[0]
-
-        for pattern in patterns:
-            match = re.search(pattern, filename, re.IGNORECASE)
-            if match:
-                return str(int(match.group(1)))
-
-        return None
-
-    def _import_prices_oracle_optimized(self, chain_name: str, branch_id: int, prices: List[Dict]):
-        """Import prices with Oracle-specific optimizations"""
-        total_batches = (len(prices) + self.batch_size - 1) // self.batch_size
-
-        # Create session for entire import
-        session = self._get_session_with_retry()
         try:
-            # Get chain once
-            chain = session.query(Chain).filter(Chain.name == chain_name).first()
-            if not chain:
-                logger.error(f"Chain {chain_name} not found")
+            # Download and parse
+            content = parser.download_file(url)
+            if not content:
                 return
 
-            # Pre-fetch existing products and prices for this branch
-            existing_products = self._get_existing_products(session, chain.chain_id, prices)
-            existing_prices = self._get_existing_prices(session, branch_id)
+            prices = parser.parse_price_data(content)
+            if not prices:
+                return
 
-            # Process in micro-batches
-            batch_count = 0
-            for i in range(0, len(prices), self.batch_size):
-                batch = prices[i:i + self.batch_size]
-                batch_num = (i // self.batch_size) + 1
+            # Group by store
+            store_prices = defaultdict(list)
+            for price in prices:
+                store_id = price.get('store_id')
+                if store_id:
+                    store_prices[store_id].append(price)
 
-                try:
-                    self._process_batch_optimized(
-                        session, chain.chain_id, branch_id,
-                        batch, existing_products, existing_prices
-                    )
+            # Process each store's prices
+            for store_id, items in store_prices.items():
+                # Find branch
+                branch_id = branch_map.get(store_id) or branch_map.get(str(int(store_id)))
+                if not branch_id:
+                    continue
 
-                    batch_count += 1
+                # Queue for batch processing
+                batch_data = {
+                    'branch_id': branch_id,
+                    'items': items
+                }
 
-                    # Commit at intervals
-                    if batch_count % self.commit_interval == 0 or batch_num == total_batches:
-                        session.commit()
-                        logger.info(f"Committed batch {batch_num}/{total_batches}")
+                self.batch_queue.put(batch_data)
 
-                        # Small delay for Oracle
-                        if self._is_oracle():
-                            time.sleep(0.1)
+                with self.stats_lock:
+                    self.stats['files_processed'] += 1
 
-                except Exception as e:
-                    session.rollback()
-                    logger.error(f"Batch {batch_num} failed: {str(e)[:100]}")
-                    self.stats['errors'] += len(batch)
-                    # Continue with next batch
+        except Exception as e:
+            logger.error(f"Error processing file {filename}: {e}")
+            with self.stats_lock:
+                self.stats['files_failed'] += 1
 
-            # Final commit
-            session.commit()
+    def _batch_processor(self, chain_id: int, product_cache: dict):
+        """Process batches from queue"""
+        batch_buffer = []
 
-        finally:
-            session.close()
-
-    def _get_existing_products(self, session: Session, chain_id: int,
-                               prices: List[Dict]) -> Dict[str, ChainProduct]:
-        """Pre-fetch existing products to minimize queries"""
-        barcodes = {p['barcode'] for p in prices if p.get('barcode')}
-
-        existing = session.query(ChainProduct).filter(
-            ChainProduct.chain_id == chain_id,
-            ChainProduct.barcode.in_(list(barcodes))
-        ).all()
-
-        return {p.barcode: p for p in existing}
-
-    def _get_existing_prices(self, session: Session, branch_id: int) -> Set[int]:
-        """Pre-fetch existing price product IDs for branch"""
-        prices = session.query(BranchPrice.chain_product_id).filter(
-            BranchPrice.branch_id == branch_id
-        ).all()
-
-        return {p[0] for p in prices}
-
-    def _process_batch_optimized(self, session: Session, chain_id: int, branch_id: int,
-                                 batch: List[Dict], existing_products: Dict[str, ChainProduct],
-                                 existing_price_product_ids: Set[int]):
-        """Process batch with minimal queries"""
-
-        for item in batch:
+        while True:
             try:
-                barcode = item['barcode']
-                new_price = float(item.get('price', 0))
-                name = item.get('name', '')[:255]
+                # Get batch data with timeout
+                batch_data = self.batch_queue.get(timeout=5)
 
-                # Get or create product
-                if barcode in existing_products:
-                    product = existing_products[barcode]
-                else:
-                    # Create new product
-                    product = ChainProduct(
-                        chain_id=chain_id,
-                        barcode=barcode,
-                        name=name
-                    )
-                    session.add(product)
-                    session.flush()  # Get ID
-                    existing_products[barcode] = product
-                    self.stats['products_created'] += 1
+                if batch_data is None:  # Stop signal
+                    break
 
-                # Check if price exists
-                if product.chain_product_id in existing_price_product_ids:
-                    # Update existing price
-                    session.execute(
-                        text("""
-                            UPDATE branch_prices
-                            SET price = :price, last_updated = :updated
-                            WHERE chain_product_id = :product_id
-                            AND branch_id = :branch_id
-                        """),
-                        {
-                            'price': new_price,
-                            'updated': datetime.utcnow(),
-                            'product_id': product.chain_product_id,
-                            'branch_id': branch_id
+                batch_buffer.append(batch_data)
+
+                # Process when buffer is full
+                if len(batch_buffer) >= 10:
+                    self._process_batch_buffer(batch_buffer, chain_id, product_cache)
+                    batch_buffer = []
+
+            except queue.Empty:
+                # Process remaining items
+                if batch_buffer:
+                    self._process_batch_buffer(batch_buffer, chain_id, product_cache)
+                    batch_buffer = []
+            except Exception as e:
+                logger.error(f"Batch processor error: {e}")
+
+        # Final processing
+        if batch_buffer:
+            self._process_batch_buffer(batch_buffer, chain_id, product_cache)
+
+    def _process_batch_buffer(self, batch_buffer: list, chain_id: int,
+                              product_cache: dict):
+        """Process accumulated batches efficiently"""
+        if not batch_buffer:
+            return
+
+        with get_db_with_retry() as session:
+            try:
+                # Prepare bulk data
+                all_products = []
+                all_prices = []
+
+                for batch_data in batch_buffer:
+                    branch_id = batch_data['branch_id']
+
+                    for item in batch_data['items']:
+                        barcode = item.get('barcode')
+                        if not barcode:
+                            continue
+
+                        # Get or create product
+                        if barcode not in product_cache:
+                            product = self._get_or_create_product(
+                                session, chain_id, barcode, item.get('name', '')
+                            )
+                            product_cache[barcode] = product.chain_product_id
+
+                        # Prepare price data
+                        price_data = {
+                            'chain_product_id': product_cache[barcode],
+                            'branch_id': branch_id,
+                            'price': float(item.get('price', 0)),
+                            'last_updated': datetime.utcnow()
                         }
-                    )
-                    self.stats['prices_updated'] += 1
-                else:
-                    # Create new price
-                    price = BranchPrice(
-                        chain_product_id=product.chain_product_id,
-                        branch_id=branch_id,
-                        price=new_price,
-                        last_updated=datetime.utcnow()
-                    )
-                    session.add(price)
-                    existing_price_product_ids.add(product.chain_product_id)
-                    self.stats['prices_created'] += 1
+                        all_prices.append(price_data)
+
+                # Bulk upsert prices
+                if all_prices:
+                    self._bulk_upsert_prices(session, all_prices)
+
+                session.commit()
+
+                with self.stats_lock:
+                    self.stats['prices_processed'] += len(all_prices)
 
             except Exception as e:
-                logger.debug(f"Error processing item {item.get('barcode', 'unknown')}: {str(e)[:100]}")
-                self.stats['errors'] += 1
+                session.rollback()
+                logger.error(f"Batch processing error: {e}")
+                with self.stats_lock:
+                    self.stats['errors'] += len(batch_buffer)
 
-    def _show_summary(self):
+    def _get_or_create_product(self, session: Session, chain_id: int,
+                                barcode: str, name: str) -> ChainProduct:
+        """Get or create product efficiently"""
+        # Try to get existing
+        product = session.query(ChainProduct).filter(
+            ChainProduct.chain_id == chain_id,
+            ChainProduct.barcode == barcode
+        ).first()
+
+        if not product:
+            product = ChainProduct(
+                chain_id=chain_id,
+                barcode=barcode,
+                name=name[:255]  # Ensure fits in column
+            )
+            session.add(product)
+            session.flush()  # Get ID without committing
+
+            with self.stats_lock:
+                self.stats['products_created'] += 1
+
+        return product
+
+    def _bulk_upsert_prices(self, session: Session, price_data: list):
+        """Bulk upsert prices using Oracle MERGE or PostgreSQL ON CONFLICT"""
+        if USE_ORACLE:
+            # Use MERGE for Oracle
+            merge_sql = text("""
+                MERGE INTO branch_prices bp
+                USING (
+                    SELECT :chain_product_id as chain_product_id,
+                           :branch_id as branch_id,
+                           :price as price,
+                           :last_updated as last_updated
+                    FROM dual
+                ) src
+                ON (bp.chain_product_id = src.chain_product_id
+                    AND bp.branch_id = src.branch_id)
+                WHEN MATCHED THEN
+                    UPDATE SET bp.price = src.price,
+                               bp.last_updated = src.last_updated
+                WHEN NOT MATCHED THEN
+                    INSERT (price_id, chain_product_id, branch_id, price, last_updated)
+                    VALUES (price_id_seq.NEXTVAL, src.chain_product_id,
+                            src.branch_id, src.price, src.last_updated)
+            """)
+
+            # Execute in batches
+            for i in range(0, len(price_data), self.batch_size):
+                batch = price_data[i:i + self.batch_size]
+                session.execute(merge_sql, batch)
+
+                with self.stats_lock:
+                    self.stats['prices_updated'] += len(batch)
+        else:
+            # For SQLite/PostgreSQL, use simpler approach
+            for price in price_data:
+                existing = session.query(BranchPrice).filter(
+                    BranchPrice.chain_product_id == price['chain_product_id'],
+                    BranchPrice.branch_id == price['branch_id']
+                ).first()
+
+                if existing:
+                    existing.price = price['price']
+                    existing.last_updated = price['last_updated']
+                else:
+                    session.add(BranchPrice(**price))
+
+    def _show_summary(self, elapsed_time: float):
         """Show import summary"""
         logger.info(f"\n{'='*60}")
-        logger.info("Import Summary:")
-        logger.info(f"{'='*60}")
-        logger.info(f"Files processed: {self.stats['files_processed']}")
-        logger.info(f"Files skipped: {self.stats['files_skipped']}")
-        logger.info(f"Products created: {self.stats['products_created']}")
-        logger.info(f"Products updated: {self.stats['products_updated']}")
-        logger.info(f"Prices created: {self.stats['prices_created']}")
-        logger.info(f"Prices updated: {self.stats['prices_updated']}")
-        logger.info(f"Branches skipped: {self.stats['branches_skipped']}")
-        logger.info(f"Connection retries: {self.stats['connection_retries']}")
-        logger.info(f"Errors: {self.stats['errors']}")
+        logger.info("IMPORT SUMMARY")
         logger.info(f"{'='*60}")
 
+        with self.stats_lock:
+            for key, value in sorted(self.stats.items()):
+                logger.info(f"{key.replace('_', ' ').title()}: {value:,}")
+
+        logger.info(f"\nTotal time: {elapsed_time:.1f} seconds")
+
+        if self.stats['prices_processed'] > 0:
+            rate = self.stats['prices_processed'] / elapsed_time
+            logger.info(f"Processing rate: {rate:,.0f} prices/second")
 
 def main():
-    """Main entry point"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Import prices with Oracle optimizations')
-    parser.add_argument('--chain', choices=['shufersal', 'victory'],
-                        help='Import specific chain only')
-    parser.add_argument('--limit', type=int, default=0,
-                        help='Limit number of files to process (0 = no limit)')
-    parser.add_argument('--batch-size', type=int,
-                        help='Override batch size')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--chain', choices=['shufersal', 'victory'], required=True)
+    parser.add_argument('--limit', type=int, help='Limit files to process')
+    parser.add_argument('--workers', type=int, help='Number of worker threads')
     args = parser.parse_args()
 
-    importer = OracleOptimizedImporter()
+    importer = OptimizedPriceImporter()
 
-    if args.batch_size:
-        importer.batch_size = args.batch_size
-        logger.info(f"Using custom batch size: {args.batch_size}")
+    if args.workers:
+        importer.max_workers = args.workers
 
-    chains = [args.chain] if args.chain else ['shufersal', 'victory']
-
-    for chain in chains:
-        importer.import_chain_prices(chain, args.limit if args.limit > 0 else None)
-
+    try:
+        importer.import_chain_prices(args.chain, args.limit)
+    except KeyboardInterrupt:
+        logger.info("\nImport interrupted")
+    except Exception as e:
+        logger.error(f"Import failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

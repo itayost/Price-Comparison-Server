@@ -27,6 +27,7 @@ python-dotenv==1.0.0
 schedule==1.2.0
 psutil==5.9.8
 python-multipart==0.0.6
+pandas==2.1.4  # Add this line
 
 # Testing dependencies (simplified for university project)
 pytest==7.4.3

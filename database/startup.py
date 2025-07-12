@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from .connection import engine, get_db, USE_ORACLE, init_db
+from .connection import engine, get_db_optimized, get_db_with_retry, USE_ORACLE, init_db
 from .new_models import Chain, Branch, ChainProduct, BranchPrice, User, SavedCart
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class DatabaseStartup:
                     return health
 
                 # Check data existence
-                with get_db() as db:
+                with get_db_optimized() as db:
                     health['details'] = {
                         'chains': db.query(func.count(Chain.chain_id)).scalar(),
                         'branches': db.query(func.count(Branch.branch_id)).scalar(),
