@@ -1,12 +1,13 @@
-# price_comparison_server/database/connection.py
+# database/connection.py
+"""Enhanced database connection with Oracle timeout handling"""
 
 import os
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool, QueuePool
-from sqlalchemy.exc import DatabaseError, DisconnectionError
+from sqlalchemy.exc import DatabaseError, DisconnectionError, OperationalError
 from contextlib import contextmanager
 from typing import Generator
 from dotenv import load_dotenv
@@ -15,8 +16,8 @@ import time
 # Load environment variables
 load_dotenv()
 
-# Import models
-from .new_models import Base, User, Chain, Branch, ChainProduct, BranchPrice, SavedCart
+# Import models - but only after engine is created
+# This will be done at the bottom of the file
 
 logger = logging.getLogger(__name__)
 
@@ -24,74 +25,109 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
 USE_ORACLE = os.getenv("USE_ORACLE", "false").lower() == "true"
 
+# Initialize engine and SessionLocal as None
+engine = None
+SessionLocal = None
+
 # For Oracle with wallet
 TNS_ADMIN = os.getenv("TNS_ADMIN") or os.getenv("ORACLE_WALLET_DIR", "./wallet")
 
-if USE_ORACLE:
-    # Oracle configuration
-    wallet_dir = Path(TNS_ADMIN).resolve()
-    os.environ['TNS_ADMIN'] = str(wallet_dir)
+def create_database_engine():
+    """Create and return the database engine"""
+    global engine, SessionLocal
 
-    # Build Oracle connection string
-    ORACLE_USER = os.getenv("ORACLE_USER")
-    ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
-    ORACLE_DSN = os.getenv("ORACLE_DSN") or os.getenv("ORACLE_SERVICE", "champdb_low")
-
-    # Enhanced connect args for Oracle
-    connect_args = {
-        "config_dir": str(wallet_dir),
-        "wallet_location": str(wallet_dir),
-        # Connection timeout settings (only supported parameters)
-        "tcp_connect_timeout": 30,
-        "retry_count": 3,
-        "retry_delay": 1
-    }
-
-    # Add wallet password if provided
-    wallet_password = os.getenv("ORACLE_WALLET_PASSWORD")
-    if wallet_password:
-        connect_args["wallet_password"] = wallet_password
-
-    DATABASE_URL = f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}@{ORACLE_DSN}"
-
-    logger.info(f"Using Oracle database with TNS_ADMIN: {wallet_dir}")
-    logger.info(f"Connecting to DSN: {ORACLE_DSN}")
-else:
-    # SQLite/PostgreSQL configuration
-    if not DATABASE_URL:
-        DATABASE_URL = "sqlite:///./price_comparison.db"
-    logger.info(f"Using database: {DATABASE_URL}")
-
-# Create engine with appropriate settings
-try:
     if USE_ORACLE:
-        # Oracle-specific engine configuration
-        engine = create_engine(
-            DATABASE_URL,
-            # Use NullPool to avoid connection pooling issues with Oracle
-            poolclass=NullPool,
-            echo=os.getenv("SQL_ECHO", "false").lower() == "true",
-            connect_args=connect_args,
-            # Additional engine options for Oracle
-            pool_pre_ping=True,  # Check connections before using
-            pool_recycle=300,    # Recycle connections after 5 minutes
-        )
+        try:
+            import oracledb
+
+            # Oracle configuration
+            wallet_dir = Path(TNS_ADMIN).resolve()
+
+            # Ensure wallet directory exists
+            if not wallet_dir.exists():
+                raise FileNotFoundError(f"Oracle wallet directory not found: {wallet_dir}")
+
+            os.environ['TNS_ADMIN'] = str(wallet_dir)
+
+            # Configure oracledb defaults BEFORE creating connection
+            oracledb.defaults.config_dir = str(wallet_dir)
+            oracledb.defaults.tcp_connect_timeout = 30.0
+            oracledb.defaults.call_timeout = 60000  # 60 seconds
+            oracledb.defaults.prefetchrows = 100
+            oracledb.defaults.arraysize = 100
+
+            logger.info(f"Oracle wallet directory: {wallet_dir}")
+
+        except ImportError:
+            logger.error("oracledb not installed. Install with: pip install oracledb")
+            raise
+
+        # Build Oracle connection string
+        ORACLE_USER = os.getenv("ORACLE_USER")
+        ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
+        ORACLE_DSN = os.getenv("ORACLE_DSN") or os.getenv("ORACLE_SERVICE", "champdb_low")
+
+        if not all([ORACLE_USER, ORACLE_PASSWORD]):
+            raise ValueError("ORACLE_USER and ORACLE_PASSWORD must be set in .env file")
+
+        # Connect args for Oracle
+        connect_args = {
+            "config_dir": str(wallet_dir),
+            "wallet_location": str(wallet_dir),
+        }
+
+        # Add wallet password if provided
+        wallet_password = os.getenv("ORACLE_WALLET_PASSWORD")
+        if wallet_password:
+            connect_args["wallet_password"] = wallet_password
+
+        DATABASE_URL = f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}@{ORACLE_DSN}"
+
+        logger.info(f"Using Oracle database with TNS_ADMIN: {wallet_dir}")
+        logger.info(f"Connecting to DSN: {ORACLE_DSN}")
+
+        # Create engine with minimal configuration first
+        try:
+            engine = create_engine(
+                DATABASE_URL,
+                poolclass=NullPool,  # No connection pooling for Oracle
+                connect_args=connect_args,
+                echo=os.getenv("SQL_ECHO", "false").lower() == "true"
+            )
+        except Exception as e:
+            logger.error(f"Failed to create Oracle engine: {e}")
+            raise
+
     else:
-        # SQLite/PostgreSQL engine
+        # SQLite/PostgreSQL configuration
+        if not DATABASE_URL:
+            DATABASE_URL = "sqlite:///./price_comparison.db"
+
+        logger.info(f"Using database: {DATABASE_URL}")
+
         engine = create_engine(
             DATABASE_URL,
-            echo=os.getenv("SQL_ECHO", "false").lower() == "true",
-            connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-            # Use standard pool for SQLite/PostgreSQL
-            poolclass=QueuePool,
-            pool_size=10,
-            max_overflow=20,
-            pool_pre_ping=True
+            pool_pre_ping=True,
+            echo=os.getenv("SQL_ECHO", "false").lower() == "true"
         )
 
-    # Test connection with retry
+    # Create session factory
+    SessionLocal = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+        expire_on_commit=False
+    )
+
+    return engine, SessionLocal
+
+
+def test_engine_connection(engine):
+    """Test the engine connection"""
     max_retries = 3
-    for attempt in range(max_retries):
+    retry_count = 0
+
+    while retry_count < max_retries:
         try:
             with engine.connect() as conn:
                 if USE_ORACLE:
@@ -99,29 +135,52 @@ try:
                 else:
                     result = conn.execute(text("SELECT 1"))
                 result.fetchone()
-                logger.info("✅ Database connection successful!")
-                break
+                logger.info("Database connection test successful")
+                return True
         except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Database connection attempt {attempt + 1} failed, retrying...")
-                time.sleep(2 ** attempt)
+            retry_count += 1
+            if retry_count < max_retries:
+                logger.warning(f"Connection test failed (attempt {retry_count}/{max_retries}): {str(e)[:100]}")
+                time.sleep(2 ** retry_count)
             else:
+                logger.error(f"Connection test failed after {max_retries} attempts: {e}")
                 raise
+    return False
+
+
+# Create engine and session factory
+try:
+    engine, SessionLocal = create_database_engine()
+
+    # Only test connection if not in import phase
+    if os.getenv("SKIP_DB_TEST", "false").lower() != "true":
+        test_engine_connection(engine)
 
 except Exception as e:
-    logger.error(f"❌ Database connection failed: {str(e)}")
-    if USE_ORACLE:
-        logger.error(f"TNS_ADMIN is set to: {os.environ.get('TNS_ADMIN')}")
-        logger.error("Make sure wallet files are in the correct location")
-    raise
+    logger.error(f"Failed to initialize database: {e}")
+    # Don't raise during import - allow the module to load
+    if os.getenv("TESTING", "false").lower() == "true":
+        raise
 
-# Create session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_db() -> Generator[Session, None, None]:
+    """Get database session"""
+    if not SessionLocal:
+        raise RuntimeError("Database not initialized. Call create_database_engine() first.")
+
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 @contextmanager
-def get_db() -> Generator[Session, None, None]:
-    """Get database session with automatic cleanup"""
+def get_db_context() -> Generator[Session, None, None]:
+    """Context manager for database session"""
+    if not SessionLocal:
+        raise RuntimeError("Database not initialized. Call create_database_engine() first.")
+
     db = SessionLocal()
     try:
         yield db
@@ -133,46 +192,11 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-@contextmanager
-def get_db_with_retry(max_retries: int = 3) -> Generator[Session, None, None]:
-    """Get database session with retry logic for Oracle timeouts"""
-    last_error = None
-
-    for attempt in range(max_retries):
-        db = SessionLocal()
-        try:
-            # Test the connection
-            if USE_ORACLE:
-                db.execute(text("SELECT 1 FROM DUAL"))
-            else:
-                db.execute(text("SELECT 1"))
-
-            yield db
-            db.commit()
-            return
-
-        except (DatabaseError, DisconnectionError) as e:
-            db.rollback()
-            last_error = e
-            logger.warning(f"Database error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
-
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
-
-        except Exception as e:
-            db.rollback()
-            raise
-
-        finally:
-            db.close()
-
-    # If we get here, all retries failed
-    logger.error(f"All database retry attempts failed")
-    raise last_error
-
-
 def get_db_session():
-    """FastAPI dependency for database sessions"""
+    """Dependency for FastAPI routes"""
+    if not SessionLocal:
+        raise RuntimeError("Database not initialized. Call create_database_engine() first.")
+
     db = SessionLocal()
     try:
         yield db
@@ -180,111 +204,155 @@ def get_db_session():
         db.close()
 
 
+def get_db_with_retry(max_retries: int = 3) -> Generator[Session, None, None]:
+    """Get database session with retry logic for Oracle timeouts"""
+    if not SessionLocal:
+        raise RuntimeError("Database not initialized. Call create_database_engine() first.")
+
+    retry_count = 0
+    last_error = None
+
+    while retry_count < max_retries:
+        db = None
+        try:
+            db = SessionLocal()
+            # Test connection
+            if USE_ORACLE:
+                db.execute(text("SELECT 1 FROM DUAL"))
+            else:
+                db.execute(text("SELECT 1"))
+
+            yield db
+            return
+
+        except (DatabaseError, DisconnectionError, OperationalError) as e:
+            retry_count += 1
+            last_error = e
+
+            if db:
+                db.close()
+
+            if retry_count < max_retries:
+                wait_time = 2 ** (retry_count - 1)  # Exponential backoff
+                logger.warning(f"Database connection failed (attempt {retry_count}/{max_retries}), "
+                              f"retrying in {wait_time}s: {str(e)[:100]}")
+                time.sleep(wait_time)
+
+                # Dispose of the engine pool to force new connections
+                if engine:
+                    engine.dispose()
+            else:
+                logger.error(f"Database connection failed after {max_retries} attempts")
+                raise last_error
+
+
 def init_db():
     """Initialize database tables"""
+    if not engine:
+        logger.error("Cannot initialize database - engine not created")
+        return
+
     try:
-        logger.info("Initializing database tables...")
+        # Import models here to avoid circular imports
+        from .new_models import Base, Chain, Branch, ChainProduct, BranchPrice, User, SavedCart
 
-        if USE_ORACLE:
-            logger.info("Using Oracle database...")
-
-            # Drop tables if requested (careful!)
-            if os.getenv("DROP_TABLES", "false").lower() == "true":
-                logger.warning("Dropping existing tables...")
-                Base.metadata.drop_all(bind=engine)
-
-        # Create all tables
+        logger.info("Creating database tables...")
         Base.metadata.create_all(bind=engine)
-        logger.info("✅ Database tables created successfully!")
+        logger.info("Database tables created successfully")
 
-        # Create default chains with retry logic
-        with get_db_with_retry() as db:
-            existing_chains = db.query(Chain).count()
-            if existing_chains == 0:
-                logger.info("Creating default chains...")
-
-                chains = [
-                    Chain(name="shufersal", display_name="שופרסל"),
-                    Chain(name="victory", display_name="ויקטורי")
-                ]
-
-                for chain in chains:
-                    existing = db.query(Chain).filter(Chain.name == chain.name).first()
-                    if not existing:
-                        db.add(chain)
-                        logger.info(f"Created chain: {chain.display_name}")
-
-                db.commit()
-                logger.info("✅ Default chains created!")
+        # Test each table
+        with get_db_context() as db:
+            for table_name, model in [
+                ("chains", Chain),
+                ("branches", Branch),
+                ("chain_products", ChainProduct),
+                ("branch_prices", BranchPrice),
+                ("users", User),
+                ("saved_carts", SavedCart)
+            ]:
+                try:
+                    count = db.query(model).count()
+                    logger.info(f"Table {table_name}: {count} records")
+                except Exception as e:
+                    logger.warning(f"Could not query table {table_name}: {e}")
 
     except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
-        raise
+        logger.error(f"Failed to initialize database: {e}")
+        if os.getenv("TESTING", "false").lower() == "true":
+            raise
 
 
-# Create a helper function for manual connection recovery
-def recover_connection():
-    """Attempt to recover a failed database connection"""
-    global engine, SessionLocal
-
-    logger.info("Attempting to recover database connection...")
-
+def test_connection():
+    """Test database connection"""
     try:
-        # Close existing engine
-        engine.dispose()
-
-        # Recreate engine
-        if USE_ORACLE:
-            wallet_dir = Path(TNS_ADMIN).resolve()
-            connect_args = {
-                "config_dir": str(wallet_dir),
-                "wallet_location": str(wallet_dir),
-                "tcp_connect_timeout": 30,
-                "retry_count": 3,
-                "retry_delay": 1
-            }
-
-            wallet_password = os.getenv("ORACLE_WALLET_PASSWORD")
-            if wallet_password:
-                connect_args["wallet_password"] = wallet_password
-
-            engine = create_engine(
-                DATABASE_URL,
-                poolclass=NullPool,
-                echo=os.getenv("SQL_ECHO", "false").lower() == "true",
-                connect_args=connect_args,
-                pool_pre_ping=True,
-                pool_recycle=300,
-            )
-        else:
-            engine = create_engine(
-                DATABASE_URL,
-                echo=os.getenv("SQL_ECHO", "false").lower() == "true",
-                connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-                poolclass=QueuePool,
-                pool_size=10,
-                max_overflow=20,
-                pool_pre_ping=True
-            )
-
-        # Recreate session factory
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-        # Test connection
-        with engine.connect() as conn:
+        with get_db_with_retry() as db:
             if USE_ORACLE:
-                conn.execute(text("SELECT 1 FROM DUAL"))
+                result = db.execute(text("SELECT 'Connected to Oracle' as status FROM DUAL"))
             else:
-                conn.execute(text("SELECT 1"))
+                result = db.execute(text("SELECT 'Connected to SQLite' as status"))
 
-        logger.info("✅ Database connection recovered!")
-        return True
+            row = result.fetchone()
+            logger.info(f"Database test: {row[0]}")
+            return True
 
     except Exception as e:
-        logger.error(f"❌ Failed to recover connection: {e}")
+        logger.error(f"Database connection test failed: {e}")
         return False
 
 
+# Import models after engine is created
+if engine:
+    from .new_models import Base, User, Chain, Branch, ChainProduct, BranchPrice, SavedCart
+
+
+# Initialize database on module import if not testing
+if os.getenv("TESTING", "false").lower() != "true" and os.getenv("SKIP_DB_INIT", "false").lower() != "true":
+    try:
+        if engine:
+            init_db()
+    except Exception as e:
+        logger.warning(f"Could not initialize database on import: {e}")
+
+
 if __name__ == "__main__":
-    # Initialize database when run directly
-    init_db()
+    # Test connection when run directly
+    import sys
+
+    # Set environment to skip import-time tests
+    os.environ["SKIP_DB_TEST"] = "false"
+
+    logger.info("Testing database connection...")
+
+    # Recreate engine for testing
+    try:
+        engine, SessionLocal = create_database_engine()
+
+        if test_connection():
+            logger.info("Connection successful!")
+
+            # Import models
+            from .new_models import Chain, Branch, ChainProduct, BranchPrice, User, SavedCart
+
+            # Show table counts
+            with get_db_context() as db:
+                logger.info("\nTable counts:")
+                for model_name, model in [
+                    ("Chains", Chain),
+                    ("Branches", Branch),
+                    ("Products", ChainProduct),
+                    ("Prices", BranchPrice),
+                    ("Users", User),
+                    ("Saved carts", SavedCart)
+                ]:
+                    try:
+                        count = db.query(model).count()
+                        logger.info(f"{model_name}: {count}")
+                    except Exception as e:
+                        logger.error(f"Error querying {model_name}: {e}")
+        else:
+            logger.error("Connection failed!")
+            sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"Failed to test connection: {e}")
+        sys.exit(1)
