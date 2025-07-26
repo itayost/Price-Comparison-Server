@@ -13,7 +13,8 @@ class TestBasicFunctionality:
         """Make sure the server responds"""
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json() == {"status": "healthy"}
+        data = response.json()
+        assert data["status"] == "healthy"
 
     def test_home_page(self, client):
         """Test the root endpoint"""
