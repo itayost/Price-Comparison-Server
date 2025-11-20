@@ -1,4 +1,4 @@
-#!/Users/itayostraich/Documents/GitHub/Price-Comparison-Server/venv_oracle/bin/python3
+#!/Users/itayostraich/Documents/GitHub/Price-Comparison-Server/venv_oracle/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
